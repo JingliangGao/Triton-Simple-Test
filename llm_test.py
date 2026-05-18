@@ -107,41 +107,70 @@ def resource_monitor(interval=0.1):
             # -------------------------------------------------
 
             def monitor():
-
-                nonlocal max_gpu_memory
-                nonlocal max_used_memory
+            
                 nonlocal max_cpu_percent
+                nonlocal max_used_memory
+                nonlocal max_gpu_memory
 
-                # 初始化 CPU 统计器
-                process.cpu_percent(None)
+                prev_cpu = process.cpu_times()
+                prev_time = time.time()
 
                 while not stop_event.is_set():
+                
+                    time.sleep(interval)
 
-                    # GPU 显存
-                    gpu_memory = get_gpu_memory()
+                    # ------------------------
+                    # CPU
+                    # ------------------------
 
-                    # 系统内存
-                    used_memory = get_used_memory()
+                    curr_cpu = process.cpu_times()
+                    curr_time = time.time()
 
-                    # 当前进程 CPU 占用率
-                    cpu_percent = process.cpu_percent(
-                        interval=interval
+                    cpu_delta = (
+                        (curr_cpu.user + curr_cpu.system)
+                        - (prev_cpu.user + prev_cpu.system)
                     )
 
-                    max_gpu_memory = max(
-                        max_gpu_memory,
-                        gpu_memory
+                    wall_delta = curr_time - prev_time
+
+                    cpu_percent = (
+                        cpu_delta / wall_delta
+                    ) * 100
+
+                    max_cpu_percent = max(
+                        max_cpu_percent,
+                        cpu_percent
                     )
+
+                    prev_cpu = curr_cpu
+                    prev_time = curr_time
+
+                    # ------------------------
+                    # Host Memory
+                    # ------------------------
+
+                    mem = psutil.virtual_memory()
+
+                    used_memory = (
+                        mem.total - mem.available
+                    ) / 1024 / 1024
 
                     max_used_memory = max(
                         max_used_memory,
                         used_memory
                     )
 
-                    max_cpu_percent = max(
-                        max_cpu_percent,
-                        cpu_percent
+                    # ------------------------
+                    # GPU Memory
+                    # ------------------------
+
+                    gpu_memory = get_gpu_memory()
+
+                    max_gpu_memory = max(
+                        max_gpu_memory,
+                        gpu_memory
                     )
+
 
             monitor_thread = threading.Thread(
                 target=monitor
@@ -376,6 +405,7 @@ def send_request(
             token_index += 1
             if token_index == 1:
                 first_token_time = time.time() - inference_start
+                local_metrics['first_token_time'] = first_token_time
                 
             out_str = output_data[0][0].decode('utf-8')
             # print(out_str, end='', flush=True)
@@ -385,7 +415,7 @@ def send_request(
             out_dict = json.loads(out_str) 
             if 'timings' in list(out_dict.keys()):
                 timming_metrics = out_dict
-                timming_metrics['timings'].update({'first_token_time': first_token_time})
+
         
         output_token_data = data_item.as_numpy("token_output")
         if output_token_data is not None:
@@ -497,8 +527,8 @@ def summary_data(metrics, local_metrics=local_metrics):
     # 性能维度
     model_load_time = local_metrics.get('model_load_time', 0)
     model_unload_time = local_metrics.get('model_unload_time', 0)
-    first_token_time = timings.get('first_token_time', 0)
-    inference_cost_time = timings.get('total_inference_time', 0)
+    first_token_time = local_metrics.get('first_token_time', 0)
+    inference_cost_time = local_metrics.get('inference_cost_time', 0)
     prompt_tokens = usage.get('prompt_tokens', 0)
     prompt_per_second = timings.get('prompt_per_second', 0)
     prefill_time = prompt_tokens / prompt_per_second if prompt_per_second > 0 else 0
@@ -526,10 +556,10 @@ def summary_data(metrics, local_metrics=local_metrics):
     print(f"              | Decode阶段耗时(s) : {decode_time:.3f},  Token生成速度(tokens/s) : {decode_per_second:.3f}"    )
     print(f"              | 请求吞吐率(req/s) : {request_throughput:.2f} (" \
           f"{throughput_success}/{throughput_total} requests in {throughput_time:.3f}s)")
-    print(f"  [内存维度]  | 模型加载内存占用(Mb) :  {host_mem_load}"                                                        )
-    print(f"              | 推理峰值内存占用(Mb) : {host_mem_peak}"                                                     )
-    print(f"              | 显存占用 : {device_mem_cost} , 显存峰值 : {device_mem_peak}"                                )
-    print(f"  [CPU维度]   | CPU占用率 : {cpu_peak} "                                                                     )
+    print(f"  [内存维度]  | 模型加载内存占用(Mb) :  {host_mem_load:.3f}"                                                        )
+    print(f"              | 推理峰值内存占用(Mb) : {host_mem_peak:.3f}"                                                     )
+    print(f"              | 显存占用 : {device_mem_cost:.3f} , 显存峰值 : {device_mem_peak:.3f}"                                )
+    print(f"  [CPU维度]   | CPU占用率 : {cpu_peak:.2f} "                                                                     )
     print("|" + "-"*100 + "|")
 
 def main():
