@@ -112,8 +112,13 @@ def resource_monitor(interval=0.1):
                 nonlocal max_used_memory
                 nonlocal max_gpu_memory
 
-                prev_cpu = process.cpu_times()
-                prev_time = time.time()
+                for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    if 'kytensor' in ' '.join(p.info['cmdline']):
+                        # print("Triton PID : ", p.info['pid'])
+                        triton_pid = p.info['pid']
+                        process = psutil.Process(triton_pid)   # 监控 Triton 进程的资源占用
+
+                process.cpu_percent(interval=None)
 
                 while not stop_event.is_set():
                 
@@ -123,27 +128,12 @@ def resource_monitor(interval=0.1):
                     # CPU
                     # ------------------------
 
-                    curr_cpu = process.cpu_times()
-                    curr_time = time.time()
-
-                    cpu_delta = (
-                        (curr_cpu.user + curr_cpu.system)
-                        - (prev_cpu.user + prev_cpu.system)
-                    )
-
-                    wall_delta = curr_time - prev_time
-
-                    cpu_percent = (
-                        cpu_delta / wall_delta
-                    ) * 100
+                    cpu_percent = process.cpu_percent(interval=None)
 
                     max_cpu_percent = max(
                         max_cpu_percent,
                         cpu_percent
                     )
-
-                    prev_cpu = curr_cpu
-                    prev_time = curr_time
 
                     # ------------------------
                     # Host Memory
@@ -403,8 +393,9 @@ def send_request(
          
         if output_data is not None and len(output_data) > 0:
             token_index += 1
-            if token_index == 1:
+            if token_index == 1 :
                 first_token_time = time.time() - inference_start
+                # print("[INFO] First token received, latency: {:.3f}s".format(first_token_time))
                 local_metrics['first_token_time'] = first_token_time
                 
             out_str = output_data[0][0].decode('utf-8')
@@ -431,6 +422,68 @@ def send_request(
 
     return True
 
+
+def send_frequent_request(
+    client: grpcclient.InferenceServerClient,
+    model_name: str,
+    user_data: UserData,
+    request_type: int,
+    **kwargs
+) -> bool:
+    """
+    发送请求并等待结果
+    
+    返回:
+        success
+    """
+
+    inputs = prepare_inputs(
+        request_type=request_type,
+        request_id=kwargs.get('request_id', DEFAULT_REQUEST_ID),
+        text_input=kwargs.get('text_input', ''),
+        temperature=kwargs.get('temperature', DEFAULT_CONFIG['temperature']),
+        top_k=kwargs.get('top_k', DEFAULT_CONFIG['top_k']),
+        top_p=kwargs.get('top_p', DEFAULT_CONFIG['top_p']),
+        n_keep=kwargs.get('n_keep', DEFAULT_CONFIG['n_keep']),
+        n_predict=kwargs.get('n_predict', DEFAULT_CONFIG['n_predict']),
+        cache_prompt=kwargs.get('cache_prompt', DEFAULT_CONFIG['cache_prompt']),
+        stop=kwargs.get('stop', DEFAULT_CONFIG['stop']),
+        stream=kwargs.get('stream', DEFAULT_CONFIG['stream']),
+        lora_scale=kwargs.get('lora_scale', DEFAULT_CONFIG['lora_scale']),
+        repeat_penalty=kwargs.get('repeat_penalty', DEFAULT_CONFIG['repeat_penalty'])
+    )
+    
+    client.async_stream_infer(model_name, inputs)
+
+    answer = ""
+    metrics = {}
+    
+    while True:
+        data_item = user_data._completed_requests.get()
+        if isinstance(data_item, InferenceServerException):
+            return False
+        
+        final_response = data_item.get_response().parameters.get('triton_final_response', {}).bool_param
+        output_data = data_item.as_numpy("text_output")
+         
+        if output_data is not None and len(output_data) > 0:          
+            out_str = output_data[0][0].decode('utf-8')
+            # print(out_str, end='', flush=True)
+            answer += out_str
+        
+        output_token_data = data_item.as_numpy("token_output")
+        if output_token_data is not None:
+            metrics['tokens'] = output_token_data
+        
+        metrics_output = data_item.as_numpy("metrics_output")
+        if metrics_output is not None:
+            metrics['values'] = metrics_output
+            # print("metrics:", metrics)  # 打印性能监控数据
+        
+        if final_response:
+            break
+
+    return True
 
 
 
@@ -474,7 +527,7 @@ def run_throughput_test(
     success_requests = 0
 
     for i in range(num_requests):
-        success = send_request(client, model_name, user_data, request_type, **kwargs)
+        success = send_frequent_request(client, model_name, user_data, request_type, **kwargs)
         if not success:
             break
         success_requests += 1
@@ -559,7 +612,7 @@ def summary_data(metrics, local_metrics=local_metrics):
     print(f"  [内存维度]  | 模型加载内存占用(Mb) :  {host_mem_load:.3f}"                                                        )
     print(f"              | 推理峰值内存占用(Mb) : {host_mem_peak:.3f}"                                                     )
     print(f"              | 显存占用 : {device_mem_cost:.3f} , 显存峰值 : {device_mem_peak:.3f}"                                )
-    print(f"  [CPU维度]   | CPU占用率 : {cpu_peak:.2f} "                                                                     )
+    print(f"  [CPU维度]   | CPU占用率 : {cpu_peak:.2f}% "                                                                     )
     print("|" + "-"*100 + "|")
 
 def main():
@@ -645,6 +698,7 @@ def main():
             print("[INFO] Start to test inference ... ")
             
             inference_start = time.time()
+            print("[INFO] Sending one inference request ... ")
             total_tests += 1
             success = run_single_test(
                 triton_client, model_name, user_data,
@@ -652,7 +706,8 @@ def main():
                 "test openai completions request",
                 text_input=json.dumps(COMPLETION_REQUEST)
             )
-            inference_cost_time = time.time() - inference_start     
+            inference_cost_time = time.time() - inference_start
+            print(f"[INFO] Single inference completed, total cost time: {inference_cost_time:.3f}s")     
             local_metrics['inference_cost_time'] = inference_cost_time      
             
             success_count += success
@@ -661,6 +716,8 @@ def main():
             
             # ==================== 请求吞吐量测试 ====================
             total_tests += 1
+            multiple_inference_start = time.time()
+            print("[INFO] Sending multiple inference requests ... ")
             success = run_throughput_test(
                 triton_client, model_name, user_data,
                 RequestType.OPENAI_COMPLETIONS.value,
@@ -668,6 +725,8 @@ def main():
                 num_requests=10,
                 text_input=json.dumps(COMPLETION_REQUEST)
             )
+            multiple_inference_cost_time = time.time() - multiple_inference_start
+            print(f"[INFO] Multiple inference completed, total cost time: {multiple_inference_cost_time:.3f}s")
             success_count += success
             fail_count += 1 - success
 
