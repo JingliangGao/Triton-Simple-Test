@@ -11,7 +11,7 @@ import json
 import queue
 import time
 from enum import Enum
-from functools import partial
+from functools import partial, wraps
 from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
@@ -21,7 +21,7 @@ import psutil
 import os
 import subprocess
 from tritonclient.utils import InferenceServerException
-from functools import wraps
+
 
 
 try:
